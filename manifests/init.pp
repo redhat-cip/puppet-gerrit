@@ -11,21 +11,6 @@
 # [*gerrit_version*]
 #   Version of gerrit to install
 #
-# [*gerrit_group*]
-#   Name of group gerrit runs under
-#
-# [*gerrit_gid*]
-#   GroupId of gerrit_group
-#
-# [*gerrit_user*]
-#   Name of user gerrit runs under
-#
-# [*gerrit_groups*]
-#   Additional user groups
-#
-# [*gerrit_uid*]
-#   UserId of gerrit_user
-#
 # [*gerrit_home*]
 #   Home-Dir of gerrit user
 #
@@ -45,21 +30,16 @@
 #
 # == Author
 #   Robert Einsle <robert@einsle.de>
+#   François Charlier <francois.charlier@enovance.com>
 #
 class gerrit (
-  $gerrit_version       = params_lookup('gerrit_version'),
-  $gerrit_group         = params_lookup('gerrit_group'),
-  $gerrit_gid           = params_lookup('gerrit_gid'),
-  $gerrit_user          = params_lookup('gerrit_user'),
-  $gerrit_groups        = params_lookup('gerrit_groups'),
-  $gerrit_home          = params_lookup('gerrit_home'),
-  $gerrit_uid           = params_lookup('gerrit_uid'),
-  $gerrit_site_name     = params_lookup('gerrit_site_name'),
-  $gerrit_database_type = params_lookup('gerrit_database_type'),
-  $gerrit_java          = params_lookup('gerrit_java'),
-  $canonical_web_url    = params_lookup('canonical_web_url'),
-  $sshd_listen_address  = params_lookup('sshd_listen_address'),
-  $httpd_listen_url     = params_lookup('httpd_listen_url'),
+  $gerrit_version       = '2.7',
+  $gerrit_home          = '/opt/gerrit',
+  $gerrit_site_name     = 'review_site',
+  # $gerrit_database_type = $gerrit_database_type,
+  $canonical_web_url    = "http://${::fqdn}:8081",
+  $sshd_listen_address  = '*:29418',
+  $httpd_listen_url     = 'http://*:8081/',
   $download_mirror      = 'http://gerrit.googlecode.com/files',
   $email_format         = '{0}@example.com'
 ) inherits gerrit::params {
@@ -67,86 +47,76 @@ class gerrit (
   $gerrit_war_file = "${gerrit_home}/gerrit-${gerrit_version}.war"
 
   # Install required packages
-  package { [ 
-  "wget",
-  ]:
-    ensure => installed;
-  "gerrit_java":
-    ensure => installed,
-    name   => "${gerrit_java}",
-  }
+  ensure_packages(['wget', 'git', $gerrit_java])
 
   # Crate Group for gerrit
   group { $gerrit_group:
-    gid        => "$gerrit_gid", 
     ensure     => "present",
   }
 
   # Create User for gerrit-home
   user { $gerrit_user:
-    comment    => "User for gerrit instance",
-    home       => "$gerrit_home",
-    shell      => "/bin/false",
-    uid        => "$gerrit_uid",
-    gid        => "$gerrit_gid",
-    groups     => $gerrit_groups,
-    ensure     => "present",
+    ensure     => present,
+    comment    => 'User for gerrit instance',
+    home       => $gerrit_home,
+    shell      => '/bin/false',
+    gid        => $gerrit_group,
     managehome => true,
-    require    => Group["$gerrit_group"]
   }
 
   # Correct gerrit_home uid & gid
-  file { "${gerrit_home}":
+  file { $gerrit_home:
     ensure     => directory,
-    owner      => "${gerrit_uid}",
-    group      => "${gerrit_gid}",
-    require    => [
-      User["${gerrit_user}"],
-      Group["${gerrit_group}"],
-    ]
+    owner      => $gerrit_user,
+    group      => $gerrit_group,
   }
 
-  if versioncmp($gerrit_version, '2.5') < 0 {
+  if (versioncmp($gerrit_version, '2.5') < 0) or
+     (versioncmp($gerrit_version, '2.5.2') > 0){
     $warfile = "gerrit-${gerrit_version}.war"
   } else {
     $warfile = "gerrit-full-${gerrit_version}.war"
   }
 
   # Funktion für Download eines Files per URL
-  exec { "download_gerrit":
-    command => "wget -q '${download_mirror}/${warfile}' -O ${gerrit_war_file}",
-    creates => "${gerrit_war_file}",
-    require => [ 
-    Package["wget"],
-    User["${gerrit_user}"],
-    File[$gerrit_home]
-    ],
+  if $download_mirror =~ /^http/ {
+    exec { 'download_gerrit':
+      command => "wget -q '${download_mirror}/${warfile}' -O ${gerrit_war_file}",
+      creates => "${gerrit_war_file}",
+      require => [
+        Package['wget'],
+        User[$gerrit_user],
+        File[$gerrit_home]
+      ],
+      before => File['gerrit_war']
+    }
   }
 
   # Changes user / group of gerrit war
-  file { "gerrit_war":
-    path => "${gerrit_war_file}",
-    owner => "${gerrit_user}",
-    group => "${gerrit_group}",
-    require => Exec["download_gerrit"],
+  file { 'gerrit_war':
+    path    => $gerrit_war_file,
+    owner   => $gerrit_user,
+    group   => $gerrit_group,
+    source  => $download_mirror ? {
+      /^http/ => undef,
+      default => "${download_mirror}/${warfile}"
+    },
   }
 
-  # ´exec' doesn't work with additional groups, so we resort to sudo
-  $command = "sudo -u ${gerrit_user} java -jar ${gerrit_war_file} init -d $gerrit_home/${gerrit_site_name} --batch --no-auto-start"
+  $command = "java -jar ${gerrit_war_file} init -d $gerrit_home/${gerrit_site_name} --batch --no-auto-start"
 
   # Initialisation of gerrit site
-  exec {
-    "init_gerrit":
+  exec { 'init_gerrit':
       cwd       => $gerrit_home,
+      user      => $gerrit_user,
       command   => $command,
       creates   => "${gerrit_home}/${gerrit_site_name}/bin/gerrit.sh",
       logoutput => on_failure,
       require   => [
-        Package["${gerrit_java}"],
-        File["gerrit_war"],
-        ],
-  }
-
+        Package[$gerrit_java],
+        File['gerrit_war'],
+      ],
+  } ->
   # some init script would be nice
   file {'/etc/default/gerritcodereview':
     ensure  => present,
@@ -154,14 +124,11 @@ class gerrit (
     owner   => $gerrit_user,
     group   => $gerrit_group,
     mode    => '0444',
-    require => Exec['init_gerrit']
   }->
   file {'/etc/init.d/gerrit':
-    ensure  => symlink,
-    target  => "${gerrit_home}/${gerrit_site_name}/bin/gerrit.sh",
-    require => Exec['init_gerrit']
-  }
-
+    ensure => symlink,
+    target => "${gerrit_home}/${gerrit_site_name}/bin/gerrit.sh",
+  } ->
   # Make sure the init script starts on boot.
   file { ['/etc/rc0.d/K10gerrit',
           '/etc/rc1.d/K10gerrit',
